@@ -1,0 +1,142 @@
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use App\Models\Property;
+use App\Models\Booking;
+use App\Models\User;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
+class FixBookingData extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * @var string
+     */
+    protected $signature = 'bookings:fix-data';
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = 'Fix booking data inconsistencies between properties and bookings';
+
+    /**
+     * Execute the console command.
+     *
+     * @return int
+     */
+    public function handle()
+    {
+        $this->info('Starting booking data fix...');
+        
+        // Get all properties with status 'booked'
+        $bookedProperties = Property::where('status', 'booked')->get();
+        $this->info("Found {$bookedProperties->count()} properties with 'booked' status:");
+        
+        foreach ($bookedProperties as $property) {
+            $this->line("- Property ID: {$property->id}, Title: {$property->title}");
+        }
+        
+        // Get all bookings
+        $allBookings = Booking::with('property')->get();
+        $this->info("\nFound {$allBookings->count()} total bookings:");
+        
+        foreach ($allBookings as $booking) {
+            $propertyTitle = $booking->property ? $booking->property->title : 'Property Deleted';
+            $this->line("- Booking ID: {$booking->id}, Property: {$propertyTitle}, Status: {$booking->status}");
+        }
+        
+        // Find properties that are booked but don't have bookings
+        $missingBookings = [];
+        foreach ($bookedProperties as $property) {
+            $hasBooking = Booking::where('property_id', $property->id)
+                ->whereIn('status', ['approved', 'pending'])
+                ->exists();
+            
+            if (!$hasBooking) {
+                $missingBookings[] = $property;
+                $this->warn("Property '{$property->title}' (ID: {$property->id}) is marked as booked but has no booking record!");
+            }
+        }
+        
+        if (empty($missingBookings)) {
+            $this->info('No missing bookings found. Data is consistent.');
+            return 0;
+        }
+        
+        $this->info("\nFound " . count($missingBookings) . " properties that need booking records.");
+        
+        if ($this->confirm('Do you want to create missing booking records?')) {
+            $this->createMissingBookings($missingBookings);
+        }
+        
+        return 0;
+    }
+    
+    private function createMissingBookings($properties)
+    {
+        // Get a tenant user to assign bookings to
+        $tenant = User::where('role', 'tenant')->first();
+        
+        if (!$tenant) {
+            $this->error('No tenant user found! Creating a default tenant...');
+            $tenant = User::create([
+                'name' => 'Default Tenant',
+                'email' => 'tenant@example.com',
+                'password' => bcrypt('password'),
+                'role' => 'tenant',
+                'email_verified_at' => now(),
+            ]);
+            $this->info("Created default tenant with ID: {$tenant->id}");
+        }
+        
+        $createdCount = 0;
+        
+        foreach ($properties as $property) {
+            try {
+                $booking = new Booking();
+                $booking->property_id = $property->id;
+                $booking->user_id = $tenant->id;
+                $booking->status = 'approved';
+                $booking->check_in = now()->startOfMonth();
+                $booking->check_out = now()->addMonths(1)->endOfMonth();
+                $booking->guests = 1;
+                $booking->total_price = $property->price ?? 0;
+                $booking->special_requests = 'Auto-generated booking for data consistency';
+                $booking->is_paid = true;
+                $booking->save();
+                
+                $this->info("✓ Created booking #{$booking->id} for property '{$property->title}' (ID: {$property->id})");
+                $createdCount++;
+                
+            } catch (\Exception $e) {
+                $this->error("✗ Failed to create booking for property '{$property->title}': " . $e->getMessage());
+                Log::error('Failed to create booking', [
+                    'property_id' => $property->id,
+                    'error' => $e->getMessage()
+                ]);
+            }
+        }
+        
+        $this->info("\nSuccessfully created {$createdCount} booking records.");
+        
+        // Verify the fix
+        $this->info("\nVerifying fix...");
+        $totalBookings = Booking::count();
+        $bookedPropertiesCount = Property::where('status', 'booked')->count();
+        
+        $this->info("Total bookings: {$totalBookings}");
+        $this->info("Booked properties: {$bookedPropertiesCount}");
+        
+        if ($totalBookings >= $bookedPropertiesCount) {
+            $this->info("✓ Data is now consistent!");
+        } else {
+            $this->warn("⚠ There may still be inconsistencies. Please check manually.");
+        }
+    }
+}
